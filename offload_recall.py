@@ -1,7 +1,7 @@
 import comfy.model_management as mm
 from comfy.model_patcher import ModelPatcher
 import gc
-from typing import Tuple
+from typing import Tuple, List
 
 
 # Note: This doesn't work with reroute for some reason?
@@ -50,7 +50,8 @@ class OffloadModel:
             print(f" - [1] gc.collect()")
             gc.collect()  # run garbage collection
             print(f" - [2] offloading from {current_device} to {offload_device}")
-            move_func(offload_device)
+            for func_to in move_func:
+                func_to(offload_device)
             print(f" - [3] free VRAM cache")
             mm.soft_empty_cache()  # clear cache after offloading
             print(f" - [4] gc.collect()")
@@ -101,7 +102,8 @@ class RecallModel:
             print(f" - [2] gc.collect()")
             gc.collect()  # run garbage collection
             print(f" - [3] rapatriating from {current_device} to {preferred_device}")
-            move_func(preferred_device)
+            for func_to in move_func:
+                func_to(preferred_device)
             print(f" - [4] gc.collect()")
             print(f" - done rapatriating")
             
@@ -136,24 +138,26 @@ def check_model(model, action_desc: str = "Offload/Onload")-> bool:
         
     return True
 
-def get_device(model) -> Tuple[str, callable]:
+def get_device(model) -> Tuple[str, List[callable]]:
     """
     Get the device of the model and the function to move it to a device.
     Args:
         model: The model to check.
     Returns:
         device: (str): The device of the model.
-        move_func (callable): The function to move the model to a device.
+        move_func (List[callable]): list of functions to move the model to a device.
     """
     if type(model) == ModelPatcher:
-        migrate_func = model.model_patches_to
+        migrate_func = [model.model_patches_to]
+        migrate_func.append(model.model.to)
         current_device = model.model.device
     elif issubclass(type(model), ModelPatcher):
         print(f"- Model of type {model.__class__.__name__} is an implementation of ModelPatcher, assuming it has a 'model_patches_to' method")
-        migrate_func = model.model_patches_to
+        migrate_func = [model.model_patches_to]
+        migrate_func.append(model.model.to)
         current_device = model.model.device
     else:
-        migrate_func = model.to
+        migrate_func = [model.to]
         current_device = model.device
 
     return current_device, migrate_func

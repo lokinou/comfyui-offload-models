@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-offload-models"
 description = "Custom nodes to offload and rapatriate models from cpu."
-version = "0.0.1"
+version = "0.0.2"
 license = { text = "MIT License" }
 dependencies = []
 
