@@ -9,6 +9,6 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "OffloadModel": "Offload Model (experimental)",
-    "RecallModel": "Recall offloaded Model (experimental)",
+    "OffloadModel": "Offload Model",
+    "RecallModel": "Recall Model",
 }

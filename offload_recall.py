@@ -37,21 +37,22 @@ class OffloadModel:
 
         print(f" - Model of type {type(model_candidate).__class__.__name__} found.")
         # get the device and function do move it between devices
-        current_device, move_func = get_device(model_candidate)
+        list_devices_to_move = get_device(model_candidate)
         preferred_device = mm.get_torch_device()  # default device (i.e. most likely cuda)
         offload_device = mm.unet_offload_device()  # offload device (i.e. most likely cpu)
 
-
-        if current_device == offload_device:
+        off_device = [dev == offload_device for dev, _ in list_devices_to_move]
+        if all(off_device):
             print(f" - model already on the offload device {preferred_device}, nothing to do")
-            return (kwargs.get("value"),)
+            return (kwargs.get("value"), kwargs.get("model"),)
         else:
             print(f" - offloading the model of type {type(model_candidate)}")
             print(f" - [1] gc.collect()")
             gc.collect()  # run garbage collection
-            print(f" - [2] offloading from {current_device} to {offload_device}")
-            for func_to in move_func:
-                func_to(offload_device)
+            for i, (current_device, move_func) in enumerate(list_devices_to_move):
+                if not off_device[i]:
+                    print(f" - [2-{i}] offloading from {current_device} to {offload_device} using {move_func.__name__}")
+                    move_func(offload_device)
             print(f" - [3] free VRAM cache")
             mm.soft_empty_cache()  # clear cache after offloading
             print(f" - [4] gc.collect()")
@@ -86,24 +87,25 @@ class RecallModel:
 
         print(f" - Model of type {model_candidate.__class__.__name__} found.")
         # get the device and function do move it between devices
-        current_device, move_func = get_device(model_candidate)
+        list_devices_to_move = get_device(model_candidate)
 
         preferred_device = mm.get_torch_device()  # default device (i.e. most likely cuda)
         offload_device = mm.unet_offload_device()  # offload device (i.e. most likely cpu)
 
-
-        if preferred_device == current_device:
-            print(f" - model already on the preferred device {preferred_device}, nothing to do")
-            return (kwargs.get("value"),)
+        on_device = [dev == preferred_device for dev, _ in list_devices_to_move]
+        if all(on_device):
+            print(f" - Model already on the Preferred device {preferred_device}, nothing to do")
+            return (kwargs.get("value"), kwargs.get("model"))
         else:
             print(f" - rapatriating the model of type {model_candidate.__class__.__name__}")
             print(f" - [1] free VRAM cache")
             mm.soft_empty_cache()  # clear cache after offloading
             print(f" - [2] gc.collect()")
             gc.collect()  # run garbage collection
-            print(f" - [3] rapatriating from {current_device} to {preferred_device}")
-            for func_to in move_func:
-                func_to(preferred_device)
+            for i, (current_device, move_func) in enumerate(list_devices_to_move):
+                if not on_device[i]:
+                    print(f" - [3-{i}] rapatriating from {current_device} to {preferred_device} using {move_func.__name__}")
+                    move_func(preferred_device)
             print(f" - [4] gc.collect()")
             print(f" - done rapatriating")
             
@@ -144,20 +146,17 @@ def get_device(model) -> Tuple[str, List[callable]]:
     Args:
         model: The model to check.
     Returns:
-        device: (str): The device of the model.
-        move_func (List[callable]): list of functions to move the model to a device.
+        List[Tuple[str, callable]]: A list of tuples containing the current device and the function to move the model to a device.
     """
+    ret = []
     if type(model) == ModelPatcher:
-        migrate_func = [model.model_patches_to]
-        migrate_func.append(model.model.to)
-        current_device = model.model.device
+        ret.append((model.load_device, model.model_patches_to))
+        ret.append((model.model.device, model.model.to))
     elif issubclass(type(model), ModelPatcher):
         print(f"- Model of type {model.__class__.__name__} is an implementation of ModelPatcher, assuming it has a 'model_patches_to' method")
-        migrate_func = [model.model_patches_to]
-        migrate_func.append(model.model.to)
-        current_device = model.model.device
+        ret.append((model.load_device, model.model_patches_to))
+        ret.append((model.model.device, model.model.to))
     else:
-        migrate_func = [model.to]
-        current_device = model.device
+        ret.append((model.device, model.to))
 
-    return current_device, migrate_func
+    return ret
