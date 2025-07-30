@@ -29,7 +29,7 @@ git clone https://github.com/lokinou/comfyui-offload-models.git
 ```
 
 ## Updates
-* `0.0.3` : Fixed a faulty condition, improved node names, individualized modelpatcher and model which may be on different devices at once
+* `1.0.0` : now working as intended, many fixes with faulty code, improved node names, individualized modelpatcher and model which may be on different devices at once, 
 * `0.0.2` : Both offload the modelpatcher and the referenced model, otherwise it doesn't free VRAM
 * `0.0.1` : First version uploaded, with an Experimental flag
 
