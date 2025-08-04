@@ -1,22 +1,64 @@
 import comfy.model_management as mm
 from comfy.model_patcher import ModelPatcher
+from typing import Tuple, List, Union
+from dataclasses import dataclass
+import torch
 import gc
-from typing import Tuple, List
+import logging
 
+logger = logging.getLogger(__name__)
 
 # Note: This doesn't work with reroute for some reason?
 class AnyType(str):
     def __ne__(self, __value: object) -> bool:
         return False
 
+
+@dataclass
+class ModelInfo:
+    classname: str
+    device_current: Union[torch.device, int]
+    device_target: Union[torch.device, int]
+    device_offload: Union[torch.device, int]
+    move_func: callable  # function to call to change the device
+
+
 any = AnyType("*")
+
+UNSUPPORTED_CHK = [
+    (
+        ['model', 'diffusion_model', 'model'],
+        "NunchakuFluxTransformer2dModel",
+        "Nunchaku not supported (offloading managed in the binaries).\n"
+        "Disable this offload node, and use the option to enable/disable automatic offloading in the nunchaku loader.",
+    ),
+    (
+        ['diffusion_model', 'model'],
+        "NunchakuFluxTransformer2dModel",
+        "Nunchaku not supported (offloading managed in the binaries).\n"
+        "Disable this offload node, and use the option to enable/disable automatic offloading in the nunchaku loader.",
+    ),
+]
+
+
+device_options = ["auto","cpu"]
+if torch.cuda.is_available():
+    for i in range(torch.cuda.device_count()):
+        # This creates user-friendly names like "cuda:0"
+        device_name = torch.cuda.get_device_name(i)
+        #device_options.append(f"cuda:{i} ({device_name})")  # People should know already their devices :)
+        device_options.append(f"{torch.device(i)}")
 
 class OffloadModel:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {"value": (any, )}, # For passthrough
-            "optional": {"model": (any, )},
+            "optional": {"model": (any, ),
+                         "device": (device_options, {"default": "auto", "label": "Load Device", "tooltip": "Select the device to offload the model to."}),
+                         "on_error": (["ignore", "raise"], {"default": "raise", "label": "On Error", "tooltip": "What to do on error: ignore or raise an exception."}),
+                         "enable": ("BOOLEAN", {"default": True, "label": "Enable Offload", "tooltip": "Enable offloading of the model to the offload device."})                         
+                         },
         }
     
     @classmethod
@@ -28,37 +70,53 @@ class OffloadModel:
     CATEGORY = "Unload Model"
     
     def route(self, **kwargs):
-        print("Offload Model:")
-
+        logging.info("Offload Model (node)")
         model_candidate = kwargs.get("model")
+        
+        if not kwargs.get("enable", True):
+            return (kwargs.get("value"), kwargs.get("model"),)
+
         # Check if the model is valid
-        if not check_model(model=model_candidate, action_desc="Offload"):
+        if not is_supported(model_candidate=model_candidate, on_error=kwargs.get("on_error", "raise"))[0]:
             return (kwargs.get("value"), kwargs.get("model"),)
 
-        print(f" - Model of type {type(model_candidate).__class__.__name__} found.")
         # get the device and function do move it between devices
-        list_devices_to_move = get_device(model_candidate)
-        preferred_device = mm.get_torch_device()  # default device (i.e. most likely cuda)
-        offload_device = mm.unet_offload_device()  # offload device (i.e. most likely cpu)
-
-        off_device = [dev == offload_device for dev, _ in list_devices_to_move]
-        if all(off_device):
-            print(f" - model already on the offload device {preferred_device}, nothing to do")
-            return (kwargs.get("value"), kwargs.get("model"),)
-        else:
-            print(f" - offloading the model of type {type(model_candidate)}")
-            print(f" - [1] gc.collect()")
-            gc.collect()  # run garbage collection
-            for i, (current_device, move_func) in enumerate(list_devices_to_move):
-                if not off_device[i]:
-                    print(f" - [2-{i}] offloading from {current_device} to {offload_device} using {move_func.__name__}")
-                    move_func(offload_device)
-            print(f" - [3] free VRAM cache")
-            mm.soft_empty_cache()  # clear cache after offloading
-            print(f" - [4] gc.collect()")
-            gc.collect()  # run garbage collection
-            print(f" - offloading done")
+        list_models = scan_for_models(top_model=model_candidate)
+        for model in list_models:
+            m_info: ModelInfo = get_model_info(model)
+            cls = m_info.classname
+            #preferred_device = m_info.device_target if m_info.device_target is not None else mm.get_torch_device()
             
+            if kwargs.get("device", "auto") == "auto":
+                offload_device = mm.unet_offload_device() if m_info.device_offload is not None else mm.unet_offload_device()
+            else:
+                # Use the requested device from parameters
+                offload_device = torch.device(kwargs.get("device"))
+
+            if torch.device(m_info.device_current) != torch.device(offload_device):
+
+                logging.info(f'- Offload {cls}: move from {torch.device(m_info.device_current)}'
+                      f' to {torch.device(offload_device)}...')
+                m_info.move_func(torch.device(offload_device))
+                logging.info(f'- Offload {cls}: done')
+
+            # Validate the migration
+            m_info_post: ModelInfo = get_model_info(model)
+            if torch.device(m_info_post.device_current) == torch.device(offload_device):
+                logging.info(f'- Offload {cls}: validated')
+                logging.debug('- Freeing VRAM...')
+                gc.collect()
+                mm.cleanup_models_gc()
+                mm.soft_empty_cache()
+                logging.debug('- cleanup done')
+                # todo custom cleanup for known models? eg. flux transformer
+                # model_size = mm.module_size(self.transformer)
+                # do migration to offload device
+                # mm.free_memory(model_size, device)
+            else:
+                logging.error(f'- Error for {cls}: Could not validate offloading, '
+                      f'model is on {torch.device(m_info_post.device_current)} instead of {torch.device(offload_device)}')
+
         return (kwargs.get("value"), kwargs.get("model"),)
     
     
@@ -67,7 +125,12 @@ class RecallModel:
     def INPUT_TYPES(cls):
         return {
             "required": {"value": (any, )}, # For passthrough
-            "optional": {"model": (any, )},
+            "optional": {"model": (any, ),
+                         "device": (device_options, {"default": "auto", "label": "Load Device", "tooltip": "Select the device to recall the model to."}),
+                         "on_error": (["ignore", "raise"], {"default": "raise", "label": "On Error", "tooltip": "What to do on error: ignore or raise an exception."}),
+                         "enable": ("BOOLEAN", {"default": True, "label": "Enable Recall", "tooltip": "Enable recall of the model to the preferred device."}),
+                         
+                         },
         }
     
     @classmethod
@@ -77,86 +140,131 @@ class RecallModel:
     RETURN_TYPES = (any, any)
     FUNCTION = "route"
     CATEGORY = "Unload Model"
-    
+
     def route(self, **kwargs):
-        print("Rapatriate Offloaded Model:")
+        logging.info("Recall Model (node)")
         model_candidate = kwargs.get("model")
-        # Check if the model is valid
-        if not check_model(model=model_candidate, action_desc="Rapatriate/Load"):
+        cls = model_candidate.__class__.__name__
+        if not kwargs.get("enable", True):
             return (kwargs.get("value"), kwargs.get("model"),)
 
-        print(f" - Model of type {model_candidate.__class__.__name__} found.")
-        # get the device and function do move it between devices
-        list_devices_to_move = get_device(model_candidate)
-
-        preferred_device = mm.get_torch_device()  # default device (i.e. most likely cuda)
-        offload_device = mm.unet_offload_device()  # offload device (i.e. most likely cpu)
-
-        on_device = [dev == preferred_device for dev, _ in list_devices_to_move]
-        if all(on_device):
-            print(f" - Model already on the Preferred device {preferred_device}, nothing to do")
-            return (kwargs.get("value"), kwargs.get("model"))
-        else:
-            print(f" - rapatriating the model of type {model_candidate.__class__.__name__}")
-            print(f" - [1] free VRAM cache")
-            mm.soft_empty_cache()  # clear cache after offloading
-            print(f" - [2] gc.collect()")
-            gc.collect()  # run garbage collection
-            for i, (current_device, move_func) in enumerate(list_devices_to_move):
-                if not on_device[i]:
-                    print(f" - [3-{i}] rapatriating from {current_device} to {preferred_device} using {move_func.__name__}")
-                    move_func(preferred_device)
-            print(f" - [4] gc.collect()")
-            print(f" - done rapatriating")
-            
-        return (kwargs.get("value"), kwargs.get("model"),)        # {"ui": {"text": (value,)}}
-
-def check_model(model, action_desc: str = "Offload/Onload")-> bool:
-    """
-    Check if the model has a device and a method to move it to a device.
-    Args:
-        model: The model to check.
-    Returns:
-        pass: (bool): True if the model is supported, False otherwise.
-    """
-    if model is None:
-        print(f"- Warning: No model provided (None object)")
-        return False
-    elif hasattr(model, 'model') and not hasattr(model, 'device') and not hasattr(model, 'to'):
-        if not hasattr(model, 'model_patches_to'):
-            print(f"- Warning: Cannot {action_desc} model. Model of type {model.__class__.__name__} contains a submodel {type(model.model).__class__} that has no specified 'model_patches_to'  method")
-            return False
-        if not hasattr(model.model, 'device'):
-            print(f"- Warning: Cannot {action_desc} model. Model of type {model.__class__.__name__} contains a submodel {type(model.model).__class__} that has no specified 'device'")
-            return False
-    elif not hasattr(model, 'device'):
-        # This is a model, unload it
-        print(f"- Warning: Cannot {action_desc} model. Model of type {model.__class__.__name__} has no specified 'device'")
-        return False
-    elif not hasattr(model, 'to'):
-        print(f"- Warning: Cannot {action_desc} model. Model of type {model.__class__.__name__} has no 'to' method, ")
-        return False
-
+        # Check if the model is valid
         
-    return True
+        if not is_supported(model_candidate=model_candidate, on_error=kwargs.get("on_error", "raise"))[0]:
+            return (kwargs.get("value"), kwargs.get("model"),)
+            
 
-def get_device(model) -> Tuple[str, List[callable]]:
+        # get the device and function do move it between devices
+        list_models = scan_for_models(top_model=model_candidate)
+        if len(list_models) > 0:
+            logging.debug('- Freeing VRAM...')
+            mm.soft_empty_cache()
+            gc.collect()
+            logging.debug('- done')
+        for model in list_models:
+            m_info: ModelInfo = get_model_info(model)
+            
+            if kwargs.get("device", "auto") == "auto":
+                preferred_device = m_info.device_target if m_info.device_target is not None else mm.get_torch_device()
+            else:
+                # Use the requested device from parameters
+                preferred_device = torch.device(kwargs.get("device"))
+            #offload_device = mm.unet_offload_device() if m_info.device_offload is not None else mm.unet_offload_device()
+
+            if torch.device(m_info.device_current) != torch.device(preferred_device):
+                logging.info(f'- Recall {cls} from {torch.device(m_info.device_current)}'
+                      f' to {torch.device(preferred_device)}...')
+                m_info.move_func(torch.device(preferred_device))
+                logging.info(f'- Recalling {cls} done')
+
+            # Validate the migration
+            m_info_post: ModelInfo = get_model_info(model)
+            if torch.device(m_info_post.device_current) == torch.device(preferred_device):
+                logging.info(f'- Recalling {cls} validated')
+            else:
+                logging.error(f'- Error for {cls}: Could not validate recall, '
+                      f'model is on {torch.device(m_info_post.device_current)} instead of {torch.device(preferred_device)}')
+
+        return (kwargs.get("value"), kwargs.get("model"),)
+
+def is_supported(model_candidate, on_error: str = "raise") -> Tuple[bool, str]:
     """
-    Get the device of the model and the function to move it to a device.
+    Return true if the model is supported
+    """
+    # Eclude unsupported models first
+    for nested_obj, class_name, err_msg in UNSUPPORTED_CHK:
+        # Check for unsupported models
+        if get_nested_class_name(obj=model_candidate, path=nested_obj) == class_name:
+            err_str = f"Unsupported {model_candidate.__class__.__name__} model.\n {err_msg}"
+            logging.error(f"- Error: {err_str}")
+            if on_error == "raise":
+                raise ValueError(err_str)
+            else:
+                return False, err_str
+        
+
+    # Then by default check for supported models
+    if type(model_candidate) == ModelPatcher:
+        return True, ''
+    elif issubclass(type(model_candidate), ModelPatcher):
+        logging.info(f"- model of type {model_candidate.__class__.__name__} might not be supported for Offload/recall")
+        return True, ''
+    elif hasattr(model_candidate, 'device') and hasattr(model_candidate, 'to'):
+        logging.info(f"- Model of type {model_candidate.__class__.__name__} supported (contains 'model.device' and 'model.to()')")
+        return True, ''
+    else:
+
+        # If no checks matched, log a warning   
+        logging.warning(f"- Warning: No compatible device found for this model {model_candidate.__class__.__name__}.")
+        return False
+
+
+def scan_for_models(top_model: object) -> List[object]:
+    """
+    Return supported models, and eventually embedded models
     Args:
         model: The model to check.
     Returns:
-        List[Tuple[str, callable]]: A list of tuples containing the current device and the function to move the model to a device.
+        List[object]: the current model if supported and any embedded one (e.g. ModelPatcher contains a model)
     """
-    ret = []
-    if type(model) == ModelPatcher:
-        ret.append((model.load_device, model.model_patches_to))
-        ret.append((model.model.device, model.model.to))
-    elif issubclass(type(model), ModelPatcher):
-        print(f"- Model of type {model.__class__.__name__} is an implementation of ModelPatcher, assuming it has a 'model_patches_to' method")
-        ret.append((model.load_device, model.model_patches_to))
-        ret.append((model.model.device, model.model.to))
+    if type(top_model) == ModelPatcher or issubclass(type(top_model), ModelPatcher):
+        return [top_model, top_model.model]
+    elif hasattr(top_model, 'device') and hasattr(top_model, 'to'):
+        return [top_model]
     else:
-        ret.append((model.device, model.to))
+        return []
+    
 
-    return ret
+def get_nested_class_name(obj, path):
+    for attr in path:
+        obj = getattr(obj, attr, None)
+        if obj is None:
+            return None
+    return getattr(obj.__class__, '__name__', None)
+
+
+def get_model_info(model) -> ModelInfo:
+    """
+    Get info about the model and its devices
+    Args:
+        model: The model to check.
+    Returns:
+        ModelInfo: info summary about the devices
+
+    """
+    if type(model) == ModelPatcher or issubclass(type(model), ModelPatcher):
+        # model patcher
+        mp_info = ModelInfo(classname=type(model).__name__,
+                       device_current=model.current_loaded_device(),
+                       device_target=model.load_device,
+                       device_offload=model.offload_device if hasattr(model, 'offload_device') else None,
+                       move_func=model.model_patches_to)
+        return mp_info
+
+    else:
+        m_info = ModelInfo(classname=type(model).__name__,
+                       device_current=model.device,
+                       device_target=None,
+                       device_offload=model.offload_device if hasattr(model, 'offload_device') else None,
+                       move_func=model.to)
+        return m_info
