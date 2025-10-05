@@ -1,5 +1,9 @@
 # ComfyUI Offload models
 
+**Deprecated, taken over by [comfyui-better-flow](https://github.com/lokinou/comfyui-better-flow)**
+--
+
+
 Manually offload and reload models between devices (cpu, cuda ...).
 Useful when restricted on VRAM. 
 
