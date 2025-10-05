@@ -33,6 +33,7 @@ git clone https://github.com/lokinou/comfyui-offload-models.git
 ```
 
 ## Updates
+* `1.1.1` : Deprecation note and redirection to https://github.com/lokinou/comfyui-better-flow
 * `1.1.0` : Added enable button, device button and error behavior. Now catches unsupported models and throw error messages or ignores.
 * `1.0.0` : now working as intended, many fixes with faulty code, improved node names, individualized modelpatcher and model which may be on different devices at once, 
 * `0.0.2` : Both offload the modelpatcher and the referenced model, otherwise it doesn't free VRAM
